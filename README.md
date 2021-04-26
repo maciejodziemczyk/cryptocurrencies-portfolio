@@ -16,7 +16,7 @@ Findings:
  * statistical inference about GARCH process can be biased when in sample dataset is too small (dependend on samples characteristics)
  * coronavirus had a huge impact on cryptocurriencies market (variance shocks)
  
- ## About repository
+ ## Repository description
  * ZASC projekt Maciej Odziemczyk 388581.R - R script
  * ZASC projekt Maciej Odziemczyk 388581.Rmd - R markdown file, can be used to generate an html report
  * ZASC projekt Maciej Odziemczyk 388581.html - html report generated for assignment
