@@ -2,8 +2,7 @@
 Project created for *Advanced Time Series Analysis* (org. *Zaawansowana Analiza Szeregów Czasowych*) classes at WNE UW
 
 Language:
-
-Polish - classes, report and code comments
+ * Polish - classes, report and code comments
 
 Semester: II (MA studies)
 
@@ -17,9 +16,9 @@ Findings:
  * coronavirus had a huge impact on cryptocurriencies market (variance shocks)
  
  ## About repository
-  * ZASC projekt Maciej Odziemczyk 388581.R - R script
-  * ZASC projekt Maciej Odziemczyk 388581.Rmd - R markdown file, can be used to generate an html report
-  * ZASC projekt Maciej Odziemczyk 388581.html - html report generated for assignment
+ * ZASC projekt Maciej Odziemczyk 388581.R - R script
+ * ZASC projekt Maciej Odziemczyk 388581.Rmd - R markdown file, can be used to generate an html report
+ * ZASC projekt Maciej Odziemczyk 388581.html - html report generated for assignment
 
 Main packages used in this project was rugarch amd fGarch, tseries, dygraph.
 
