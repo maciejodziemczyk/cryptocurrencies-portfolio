@@ -21,7 +21,7 @@ Findings:
  * ZASC projekt Maciej Odziemczyk 388581.Rmd - R markdown file, can be used to generate an html report
  * ZASC projekt Maciej Odziemczyk 388581.html - html report generated for assignment
 
-Main packages used in this project was rugarch amd fGarch, tseries, dygraph.
+Main packages used in this project was rugarch and fGarch, tseries, dygraph.
 
 ## Technologies
  * R 
