@@ -1,0 +1,709 @@
+---
+title: "Zaawansowana Anliza Szeregów Czasowych - projekt zaliczeniowy"
+author: "Maciej Odziemczyk"
+date: "24 06 2020"
+output: html_document
+---
+<style>
+body {
+text-align: justify}
+</style>
+
+### Wstęp
+Celem ninejszej pracy było zbadanie ryzyka portfela kryptowalut zbudowanego w myśl zasady "market-cap-weighted portfolio". Na portfel składają się 4 kryptowaluty wybrane według zadanego algorytmu - ich nazwy zaczynają się na litery, na które zaczynją się imię i nazwisko autora; w ten sposób wybrano kryptowaluty:
+
+* Mobius (MOBI),
+* MonetaryUnit (MUE),
+* OriginTrail (TRAC),
+* OKCasch (OK).
+
+Badanie ryzyka rozumiane jest jako oszacowanie funkcji warunkowej wariancji za pomocą modeli z grupy GARCH oraz oszacowanie na tej podstawie 1% wartości narażonej na ryzyko (*Value at Risk - VaR*) w okresie out of sample. Dane wykorzystane w projekcie pochodzą ze strony https://coinmarketcap.com.
+
+### Przygotowanie środowiska i danych
+Biblioteki
+
+```{r loadlib, echo=T, results='hide', message=F, warning=F}
+library('XML')
+library("RCurl")
+library('rvest')
+library('data.table')
+library('xts')
+library('dygraphs')
+library('htmltools')
+library('car')
+library('FinTS')
+library('fGarch')
+library('tseries')
+library('moments')
+library('rugarch')
+```
+
+Niestety, danych nie można pobrać wygodnie do pliku .csv, zdecydowano się zatem skorzystać z webscrappingu, w tym celu niezbędna była zmiana niektórych ustawień sesji lokalnej.
+
+```{r, results='hide', warning=F}
+# Zmiana ustawień sesji
+Sys.setlocale("LC_TIME", "C")
+options(stringsAsFactors = FALSE)
+
+# adresy url z danymi historycznymi kryptowalut i nałożonymi filtrami
+urlMOBI = "http://coinmarketcap.com/currencies/mobius/historical-data/?start=20190403&end=20200620"
+urlMUE = "http://coinmarketcap.com/currencies/monetaryunit/historical-data/?start=20190403&end=20200620"
+# O - Odziemczyk
+urlTRAC = "http://coinmarketcap.com/currencies/origintrail/historical-data/?start=20190403&end=20200620"
+urlOK = "http://coinmarketcap.com/currencies/okcash/historical-data/?start=20190403&end=20200620"
+
+# Scrapowanie
+MUE <- urlMUE %>%
+  html() %>%
+  html_nodes(xpath='//*[@id="__next"]/div/div[2]/div[1]/div[2]/div[3]/div/ul[2]/li[5]/div/div/div[2]/div[3]/div/table') %>%
+  html_table()
+MUE <- MUE[[1]]
+
+MOBI <- urlMOBI %>%
+  html() %>%
+  html_nodes(xpath='//*[@id="__next"]/div/div[2]/div[1]/div[2]/div[3]/div/ul[2]/li[5]/div/div/div[2]/div[3]/div/table') %>%
+  html_table()
+MOBI <- MOBI[[1]]
+
+OK <- urlOK %>%
+  html() %>%
+  html_nodes(xpath='//*[@id="__next"]/div/div[2]/div[1]/div[2]/div[3]/div/ul[2]/li[5]/div/div/div[2]/div[3]/div/table') %>%
+  html_table()
+OK <- OK[[1]]
+
+TRAC <- urlTRAC %>%
+  html() %>%
+  html_nodes(xpath='//*[@id="__next"]/div/div[2]/div[1]/div[2]/div[3]/div/ul[2]/li[5]/div/div/div[2]/div[3]/div/table') %>%
+  html_table()
+TRAC <- TRAC[[1]]
+
+# zmiana formatu daty
+MUE$Date = as.Date(MUE$Date, "%b %d, %Y")
+MOBI$Date = as.Date(MOBI$Date, "%b %d, %Y")
+OK$Date = as.Date(OK$Date, "%b %d, %Y")
+TRAC$Date = as.Date(TRAC$Date, "%b %d, %Y")
+
+# pozostawienie tylko interesujacych mnie kolumn (Date, Close, Market Cap)
+MUE <- MUE[c(1,5,7)]
+MOBI <- MOBI[c(1,5,7)]
+OK <- OK[c(1,5,7)]
+TRAC <- TRAC[c(1,5,7)]
+
+# zmiana nazw kolumn
+colnames(MUE) <- c("Date", "MUE_close", "MUE_cap")
+colnames(MOBI) <- c("Date", "MOBI_close", "MOBI_cap")
+colnames(OK) <- c("Date", "OK_close", "OK_cap")
+colnames(TRAC) <- c("Date", "TRAC_close", "TRAC_cap")
+
+# zmiana formatu kapitalizacji na numeric
+MUE$MUE_cap = as.numeric(gsub(',', '', MUE$MUE_cap))
+MOBI$MOBI_cap = as.numeric(gsub(',', '', MOBI$MOBI_cap))
+OK$OK_cap = as.numeric(gsub(',', '', OK$OK_cap))
+TRAC$TRAC_cap = as.numeric(gsub(',', '', TRAC$TRAC_cap))
+
+# łączenie tabel
+data = merge(MUE, MOBI, by.x = "Date", by.y = "Date")
+data = merge(data, OK, by.x = "Date", by.y = "Date")
+data = merge(data, TRAC, by.x = "Date", by.y = "Date")
+```
+
+Mając przygotowaną jedną tabelę ze wszystkimi potrzebnymi danymi dotyczącymi pojedynczych krypyowalut można przystąpić do dalszej pracy - budowy portfela.
+
+```{r}
+# total 
+data$total_cap = data$MUE_cap + data$MOBI_cap + data$OK_cap + data$TRAC_cap
+
+# udział procentowy
+data$MUE_p = (data$MUE_cap/data$total_cap)
+data$MOBI_p = (data$MOBI_cap/data$total_cap)
+data$OK_p = (data$OK_cap/data$total_cap)
+data$TRAC_p = (data$TRAC_cap/data$total_cap)
+
+# usuwanie niepotrzebnych kolumn
+data = data[-c(3, 5, 7, 9, 10)]
+
+# obliczanie logarytmicznych stóp zwrotu
+data$MUE_r = diff.xts(log(data$MUE_close))
+data$MOBI_r = diff.xts(log(data$MOBI_close))
+data$OK_r = diff.xts(log(data$OK_close))
+data$TRAC_r = diff.xts(log(data$TRAC_close))
+
+# stopy zwrotu z całego portfela
+data$total_r = (data$MUE_p*data$MUE_r
+                +data$MOBI_p*data$MOBI_r
+                +data$OK_p*data$OK_r
+                +data$TRAC_p*data$TRAC_r)
+```
+
+### Analiza portfela
+
+```{r}
+# Wykres udzialu w czasie
+share_xts = xts(data[, c("MUE_p", "MOBI_p", "OK_p", "TRAC_p")], order.by = data$Date)
+dygraph(share_xts, main = "Profil portfelowy") %>%
+  dyRangeSelector(height = 50)
+```
+
+Portfel jest w miarę zdywersyfikowany, z zastrzeżeniem okresu po kwietniu 2020, wtedy udział TRAC dochodzi nawet do 80%, ta waluta utrzymuje przez cały okres poziom powyżej 30%. Zbliżonym do TRAC udziałem do kwietnia 2020 charakteryzuje się MOBI, po tym okresie można zauważyć natomiast odwrotny trend niż w przypadku TRAC. Waluty OK i MUE stanowią dopełnienie, warto zauważyć dość stabliny poziom MUE ~10% przez większość badanego okresu, OK natomiast wahało się od ~7 do ~36%.
+Poniżej zaprezentowne zostały wykresy cen zamknięcia poszczególnych kryptowalut wraz z wariancją portfela w celu wstępnego zapoznania się z problemem i doboru kolejnych metod badawczych.
+
+```{r}
+# obiekty pomocnicze (dygraph musi mieć obiekt w formacie xts)
+close_xts = xts(data[, c("MUE_close", "MOBI_close", "OK_close", "TRAC_close")], order.by = data$Date)
+tot_ret_xts = xts(data[, c("total_r")], order.by = data$Date)
+
+dygraph(close_xts, main = 'Ceny zamknięcia dla wszystkich kryptowalut') %>%
+  dyRangeSelector(height = 50)
+
+dygraph(tot_ret_xts, main="Stopy zwrotów dla całego portfela") %>% 
+  dyRangeSelector(height = 50)
+```
+
+Wraz ze wzrostem udzialu TRAC w portfelu obserwujemy ogromny wzrost ceny tejże kryptowaluty. Do stycznia 2020
+ceny zamknięcia wykazują podobne trendy dla wszystkich walut, oczywiscie o zróżnicowanej sile, co wynika również
+z kursu, który jak warto zauważyć nie przekracza 0.1$ w żadnym przypadku. Zaobserwować możemy również zdecydowany wzrost wariancji od marca 2020 - najprawdopodobniej jest to efekt wybuchu pandemii koronawirusa, najniższą wariancję obserwujemy od czerwca 2019 do lutego 2020. Skok wariancji z początku okresu (do czerwca 2019) jest niższy niż od tych po marcu 2020, co wydaje się być zgodne z hipotezą o niestabilności rynku po wybuchu pandemii. Łatwo natomiast zauważyć zjawisko grupowania wariancji, największe skoki wariancji obswerujemy przy wzroście cen, podczas gdy w okresach spadków odchylenia od średniej wydają się być stabilne, być może wynika to z faktu gwałtowności w ruchach cenowych (szybkie wzrosty, łagodne spadki).
+Następnym etapem analizy jest wizualizacja korelogramów w celu potwierdzenia wstępnych wniosków (efekty ARCH tj. korelacja między kwadratami opóźnień zwrotów z portfela oraz zależności autoregresyjnej - korelacja pierwszego stopnia).
+
+```{r}
+# Wykres ACF dla zwrotow z portfela
+acf(data$total_r, lag.max = 36, na.action = na.pass,
+    ylim = c(-0.3, 0.3), 
+    col = "darkblue", lwd = 7,
+    main = "Wykres ACF zwrotów z portfela")
+```
+
+ACF sugeruje występowanie zależności średniej ruchomej - istotne pierwsze opóźnienie i stopniowe wygaszanie,
+warto to jednak potwierdzić formalnym testem.
+
+```{r}
+durbinWatsonTest(lm(data$total_r ~ 1),
+                 max.lag = 5) # 5 pierwszych opóźnień
+```
+
+Test Durbina-Watsona dla 5 pierwszych opóźnień potwierdził występowanie autokorelacji dla opóźnień 1 i 4 (odrzucona H0 o braku autokorelacji), co sugeruje potencjał w uwzględnieniu efektu MA(p) w modelu. Występowanie efektów ARCH zbadano za pomocą funkcji ACF dla kwadratów opóźnień zwrotów i formalnego testu ARCH LM.
+
+```{r}
+# Wykresy ACF^2 dla zwrotow z portfela (efekty ARCH)
+acf(data$total_r^2, lag.max = 100, na.action = na.pass,
+    ylim = c(-0.3, 0.3),
+    col = "darkblue", lwd = 7,
+    main = "Wykres ACF kwadratów zwrotów z portfela")
+
+# test ARCH
+ArchTest(data$total_r, lags = 5)
+```
+
+Hipoteza o braku efektow ARCH jest w tym przypadku silnie odrzucana, statystyka testowa to 58 z p value niemalże 0.
+Poniżej jeszcze test Durbina-Watsona dla konkretnych opóźnień.
+
+```{r}
+durbinWatsonTest(lm(data$total_r^2 ~ 1),
+                 max.lag = 5) # 5 pierwszych opóźnień
+```
+
+Test Durbina-Watsona pozwala na odrzucenie H0 o braku autokorelacji dla kwadratów zwrotów dla wszystkich 5 pierwszych opóźnień.
+
+W celu zbadania rozkładu zdecydowano się na wizualziację histogramu zwrotów i porównanie go z rozkładem normalnym o charakterystykach z próby.
+
+```{r}
+hist(data$total_r, prob = T, breaks = 50, main = "Histogram rozkładu zwrotów portfela", xlab="returns", col="skyblue1")
+curve(dnorm(x, mean = mean(data$total_r, na.rm = T),
+            sd  = sd(data$total_r, na.rm = T)),
+      col = "darkblue", lwd = 2, add = TRUE,
+)
+```
+
+Wykres wskazuje na ewidentną leptokurtyczność (dużo większe maksimum i grubsze ogony rozkładu empirycznego). Poniżej tabela ze statystykami rozładu.
+
+```{r}
+empstats <- basicStats(data$total_r)
+knitr::kable(as.matrix(empstats), digits = 2)
+```
+
+Kurtoza znacznie wyższa niż dla rozkładu normalnego standaryzowanego (0), co ciekawe skośność zbliżona do 0, co może sugerować, że asymetria jednak nie występuje w ogóle. Poniżej jeszcze formalny test na normalność rozkładu empirycznego.
+
+```{r}
+jbtest <- jarque.bera.test(na.omit(data$total_r)) # brak stopy zwrotu przy pierwszej obserwacji
+jbtest
+```
+
+Hipoteza o normalności rozkładu empirycznego jest silnie odrzucana, zatem dotychczasowe wnioski wydają się być poprawne, warto tutaj pamiętać o asymptotyczności testu Jarque-Bera, niniejsza próba mogłaby się okazać zbyt mała aby test był w stanie przyjąć prawdziwą H0, jednakże z analizy statystyk opisowych i histogramu nie wyciągamy przesłanek do poddawania wyników testu wątpliwościom.
+Podsumowując - trop prowadzi do modelu standardowego modelu GARCH, być może z uwzględnieniem procesu MA, a w celu sprawdzenia asymetrii (dźwigni) oszacowany zostanie model EGARCH.
+
+### Przygotowanie do modelowania
+Liczba obserwacji podyktowana jest dostępnością danych dla wszystkich kryptowalut, w badaniu zdecydowano się zbudować portfel z kryptowalut o zróżnicowanym "stażu na rynku", dlatego też próba jest dość mała (446 obserwacj). Podziału zbioru na obserwacje in sample i out of sample dokonano na podstawie charakterystyk zwrotu portfela - pożądane było uzyskanie zbliżonych charakterystyk wariancji in i out of sample. Za datę graniczną uznano 11 lutego 2020, taki podział zapewnia ponad 300 obserwacji w próbie treningowej (314) oraz 132 obserwacje w próbie testowej, ponadto zarówno jedna jak i druga próba zawiera w sobie skoki wariancji, poniżej wykresy zwrotów.
+
+```{r}
+# in sample (314 obserwacji) - zroznicowana wariancja
+ins = data[which(data$Date < "2020-02-11"),]
+
+# out of sample (132 obserwacje) - zroznicowana wariancja
+outs = data[-which(data$Date < "2020-02-11"),]
+
+
+# wykresy zwrotów in sample i out of sample
+plot(ins$Date, ins$total_r, type = "l", col = "black", lwd = 2, main = "Zwroty z portfela in sample",
+     xlab = "Data", ylab = "Zwroty z portfela")
+plot(outs$Date, outs$total_r, type = "l", col = "blue", lwd = 2, main = "Zwroty z portfela out of sample",
+     xlab = "Data", ylab = "Zwroty z portfela")
+```
+
+Poniżej przeprowadzona została standaryzacja zwrotów w celu zweryfikowania różnic w grubości ogonów rozkładu empirycznego i teoretycznego (N(0,1)) oraz jako pierwszy krok obliczenia pierwszej predykcji 1% VaR, bowiem jest to iloczyn pierwszego kwantyla rozkładu (empirycznego/teoretycznego) i prognozy odchylenia standardowego (w niniejszym badaniu jednodniowej).  
+
+```{r}
+# standaryzacja zwrotow i pierwszy kwantyl empiryczny in sample
+ins$total_r_std <- (ins$total_r - mean(ins$total_r, na.rm=T)) /
+  sd(ins$total_r, na.rm = T)
+
+total_r_std_q01 <- quantile(ins$total_r_std, 0.01, na.rm = T)
+total_r_std_q01
+qnorm(0.01, 0, 1)
+total_r_std_q01-qnorm(0.01, 0, 1)
+```
+
+Pierwszy kwantyl empiryczny jest mniejszy o ~0.18 od pierwszego kwantyla teoretycznego N(0,1), zatem szacowanie VaR musi się odbyć na podstawie rozkładu próby.
+
+### Modele GARCH
+
+Poniżej udokumentowany został proces modelowania, w celu zachowania czytelności raportu zdecydowno sie jednak na wyświetlenie jedynie porównania kryteriów informacyjnych oraz wydruków i specyfikacji najlepszych modeli, całość można zobaczyć w kodzie źródłowym, który jest dołączony do projektu.
+
+```{r, results='hide'}
+##############
+# GARCH(1,1) #
+##############
+
+spec <- ugarchspec(variance.model = list(model = "sGARCH",
+                                         garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(0, 0),
+                                     include.mean = T),
+                   distribution.model = "norm")
+
+ins.garch11 <- ugarchfit(spec = spec,
+                         data = na.omit(ins$total_r))
+
+####################
+# MA(1)-GARCH(1,1) #
+####################
+spec <- ugarchspec(variance.model = list(model = "sGARCH",
+                                         garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(0, 1),
+                                     include.mean = T),
+                   distribution.model = "norm")
+
+ins.garch11ma1 <- ugarchfit(spec = spec,
+                            data = na.omit(ins$total_r))
+########################
+# ARMA(1,1)-GARCH(1,1) #
+########################
+spec <- ugarchspec(variance.model = list(model = "sGARCH",
+                                         garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(1, 1),
+                                     include.mean = T),
+                   distribution.model = "norm")
+
+ins.garch11arma11 <- ugarchfit(spec = spec,
+                               data = na.omit(ins$total_r))
+###############################
+# ARMA(1,1)-GARCH(1,1) mu = 0 #
+###############################
+spec <- ugarchspec(variance.model = list(model = "sGARCH",
+                                         garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(1, 1),
+                                     include.mean = F),
+                   distribution.model = "norm")
+
+ins.garch11arma11mu0 <- ugarchfit(spec = spec,
+                                  data = na.omit(ins$total_r))
+############################
+# MA(1)-GARCH(1,1) mu = 0  #
+############################
+spec <- ugarchspec(variance.model = list(model = "sGARCH",
+                                         garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(0, 1),
+                                     include.mean = F),
+                   distribution.model = "norm")
+
+ins.garch11ma1mu0 <- ugarchfit(spec = spec,
+                                  data = na.omit(ins$total_r))
+```
+
+```{r, echo=F, results = 'hide'}
+###########################
+# Porownanie modeli GARCH #
+###########################
+ICsGARCH = cbind(c(-3.1465,-3.0986,-3.1468,-3.1274),c(-3.1725,-3.1126,-3.1730,-3.1486),
+                 c(-3.1787,-3.1308,-3.1790,-3.1595),c(-3.1667,-3.0949,-3.1674,-3.1380),
+                 c(-3.1722,-3.1124,-3.1727,-3.1483))
+colnames(ICsGARCH) <- c("garch11", "ma1garch11", "ma1garch11mu0", "arma11garch11", "arma11garch11mu0")
+rownames(ICsGARCH) <- c("Akaike", "Bayes", "Shibata", "Hannan-Quinn")
+```
+
+
+```{r, echo=F, results='asis'}
+library('knitr')
+kable(ICsGARCH, caption = "Porównanie modeli GARCH(1,1)")
+```
+W powyższej tabeli widzimy, że najlepszy rozpatrywany model to MA(1)-GARCH(1,1), $\mu = 0$.
+Generalnie modele GARCH(1,1) sprawdzają się bardzo dobrze w przypadku modelowania cen instrumentów finansowych, ze względu na m.in. heteroskedastyczność wariancji. W porównaniu z oryginalnym modelem ARCH model GARCH ze względu na swoją budowę jest dużo bardziej "oszczędny na parametrach" tj. jest ich mniej do oszacowania. GARCH zawsze składa się z dwóch równań: autoregresji i równania warunkowej wariancji. Standardowo równanie autoregresji to po prostu suma średniej i błędu losowego, w niniejszej pracy niezbędne okazało sie wykorzystanie efektu średniej ruchomej zatem równanie regresji ulega zmianie o komponent $\phi\epsilon_{t-1}$, jednocześnie nieistotność średniej wiąże się z usunięciem $\mu$ z równania autoregresji. Finalnie model teoretyczny prezentuje się następująco
+$$r_t=\phi\epsilon_{t-1}+u_t\\
+u_t = \sigma_t\epsilon_{t}\\
+\sigma^2_t=\omega+\alpha_1u^2_{t-1}+\beta_1\sigma^2_{t-1}$$
+
+a empiryczny (wydruk):
+```{r, echo=F}
+ins.garch11ma1mu0
+```
+Na wydruku możemy zauważyć istotność na poziomie 5% wszystkich parametrów modelu (co prawda $\alpha_1$ jest na granicy, co może wynikać z rozmiaru próby - zjawisko grupowania wariancji jest widoczne, ale umiarkowane in sample). Ponadto testy Ljunga-Boxa i ARCH LM wskazują na wyeliminowanie efektów ARCH i MA. Poniżej korelogramy.
+
+```{r}
+plot(ins.garch11ma1mu0, which = 11)
+plot(ins.garch11ma1mu0, which = 10)
+```
+
+Widzimy, że korelogramy wykazały trzy istotne (na granicy) opóźnienia pierwszego stopnia i jedno (na granicy) opóźnienie drugiego stopnia, jednak formalne testy pozwalają przyjąć hipotezę zerową o braku tychże efektów.
+Zdecydowano się również zbadać właściwości reszt modelu.
+```{r}
+hist(ins.garch11ma1mu0@fit$residuals, prob = T, breaks = 50,
+     main = "Histogram reszt modelu MA(1)-GARCH(1,1)", xlab="residuals", col="skyblue1")
+curve(dnorm(x, mean = mean(ins.garch11ma1mu0@fit$residuals, na.rm = T),
+            sd  = sd(ins.garch11ma1mu0@fit$residuals, na.rm = T)),
+      col = "darkblue", lwd = 2, add = TRUE,
+)
+
+empstats <- basicStats(ins.garch11ma1mu0@fit$residuals)
+knitr::kable(as.matrix(empstats), digits = 2)
+
+jbtest_residuals <- jarque.bera.test(ins.garch11ma1mu0@fit$residuals)
+jbtest_residuals
+
+plot(ins.garch11ma1mu0@fit$residuals, type ="l", lwd = 2, main = "Reszty modelu MA(1)-GARCH(1,1)", ylab = "Reszty")
+```
+
+Jak się można było spodziewać, wyniki nie są idealne, model nie poradził sobie całkowicie z leptokurtycznością (mimo to jest "na dobrej drodze" - kurtoza niemal dwukrotnie mniejsza niż w przypadku zwrotów z portfela), ponadto obserwujemy niewielką skośność, co skłania do oszacowania modelu EGARCH. Wariancja błędu losowego wygląda na dość stabilną, poza jednostkowymi odchyleniami, wygląda jednak na to, że model poradził sobie z grupowaniem wariancji.
+
+### Modele EGARCH
+Od samego początku badania przewija się temat efektu dźwigni. Zwroty z portfela nie charakteryzują się skośnością, analiza graficzna wskazuje na odwrotną niż zazwyczaj ma to miejsce zależność co jednak można uzasadniać gwałtownością w ruchach cenowych, z drugiej strony reszty modelu MA(1)-GARCH(1,1) wykazują zwiększoną skośnością, a korelogramy wykazują kilka opóźnień na granicy istotności zarówno pierwszego jak i drugiego stopnia. W celu ostatecznej weryfikacji asymetrii zdecydowano się oszacować model klasy EGARCH, w którym równanie regresji pozostaje niezmienione, a równanie wariancji jest zlogarytmowane i uwzględnia dodatkowy komponent $\gamma$, który w przypadku standardowej asymetrii powinien być ujemny i istotny przy jednoczesnej istotności parametru $\alpha_1$. Najlepszym z rozpatrywanych modeli EGARCH okazał się podobnie jak poprzednio model z uwzględnieniem procesu średniej ruchomej i $\mu=0$. Zatem teoretyczny model MA(1)-EGARCH(1,1) wygląda następująco:
+$$r_t=\phi\epsilon_{t-1}+u_t\\
+ln(\sigma^2_{t})=\omega+\beta_1ln(\sigma^2_{t-1})+\gamma\frac{u_{t-1}}{\sqrt{\sigma^2_{t-1}}}+\alpha_1\Bigg[\frac{|u_{t-1}|}{\sqrt{\sigma^2_{t-1}}}-\sqrt{\frac{2}{\pi}}\Bigg]$$
+Kod za pomocą, którego szacowano modele znajduje się poniżej, tak jak w poprzednim wypadku, wyświetlona została jedynie tablica porównująca kryteria informacyjne oraz wydruk z najlepszego modelu tj. MA(1)-EGARCH(1,1).
+
+```{r}
+###############
+# EGARCH(1,1) #
+###############
+spec <- ugarchspec(variance.model = list(model = "eGARCH",
+                                         garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(0, 0),
+                                     include.mean = T),
+                   distribution.model = "norm")
+
+ins.egarch11 <- ugarchfit(spec = spec,
+                          data = na.omit(ins$total_r))
+#####################
+# MA(1)-EGARCH(1,1) #
+#####################
+spec <- ugarchspec(variance.model = list(model = "eGARCH",
+                                         garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(0, 1),
+                                     include.mean = T),
+                   distribution.model = "norm")
+
+ins.egarch11ma1 <- ugarchfit(spec = spec,
+                             data = na.omit(ins$total_r))
+##########################
+# MA(1)-EGARCH(1,1) mu=0 #
+##########################
+spec <- ugarchspec(variance.model = list(model = "eGARCH",
+                                         garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(0, 1),
+                                     include.mean = F),
+                   distribution.model = "norm")
+
+ins.egarch11ma1mu0 <- ugarchfit(spec = spec,
+                             data = na.omit(ins$total_r))
+#########################
+# ARMA(1,1)-EGARCH(1,1) #
+#########################
+spec <- ugarchspec(variance.model = list(model = "eGARCH",
+                                         garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(1, 1),
+                                     include.mean = T),
+                   distribution.model = "norm")
+
+ins.egarch11arma11 <- ugarchfit(spec = spec,
+                                data = na.omit(ins$total_r))
+################################
+# ARMA(1,1)-EGARCH(1,1) mu = 0 #
+################################
+spec <- ugarchspec(variance.model = list(model = "eGARCH",
+                                         garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(1, 1),
+                                     include.mean = F),
+                   distribution.model = "norm")
+
+ins.egarch11arma11mu0 <- ugarchfit(spec = spec,
+                                   data = na.omit(ins$total_r))
+```
+
+```{r, echo=F, results = 'hide'}
+############################
+# Porownanie modeli EGARCH #
+############################
+ICsEGARCH = cbind(c(-3.1455,-3.0856,-3.1460,-3.1215),c(-3.1784,-3.1066,-3.1791,-3.1497),
+                  c(-3.1772,-3.0935,-3.1782,-3.1438),c(-3.1832,-3.1114,-3.1839,-3.1545),
+                  c(-3.1844,-3.1246,-3.1849,-3.1605))
+colnames(ICsEGARCH) <- c("egarch11", "ma1egarch11", "arma11egarch11", "arma11egarch11mu0","ma1egarch11mu0")
+rownames(ICsEGARCH) <- c("Akaike", "Bayes", "Shibata", "Hannan-Quinn")
+ICsEGARCH
+ICsGARCH
+```
+
+```{r, echo=F, results='asis'}
+kable(ICsEGARCH, caption = "Porównanie modeli EGARCH(1,1)")
+```
+Poniżej wydruk z najlepszego modelu EGARCH, czyli MA(1)-EGARCH(1,1), $\mu=0$
+```{r}
+ins.egarch11ma1mu0
+```
+Odpowiedź na pytanie o asymetrię odnajdziemy przy oszacowaniach parametru $\gamma$ i $\alpha_1$, ten pierwszy jest istotny, ale dodatni, a ten drugi jest nieistotny, zatem nie można mówić o zjawisku asymetrii w niniejszym problemie, reszta parametrów jest istotna, a testy statystyczne Ljunga-Boxa i ARCH LM wypadają gorzej niż w przypadku MA(1)-GARCH(1,1) - nie wszystkie opóźnienia pierwszego stopnia zostały zniwelowane spodziewamy się zatem gorszego dopasowania modelu EGARCH w porównaniu do GARCH tym samym również większego niedoszacowania VaR, poniżej znajduje się jeszcze analiza reszt.
+Korelogramy:
+```{r}
+plot(ins.egarch11ma1mu0, which = 11)
+plot(ins.egarch11ma1mu0, which = 10)
+
+hist(ins.egarch11ma1mu0@fit$residuals, prob = T, breaks = 50,
+     main = "Histogram reszt modelu MA(1)-GARCH(1,1)", xlab="residuals", col="skyblue1")
+curve(dnorm(x, mean = mean(ins.egarch11ma1mu0@fit$residuals, na.rm = T),
+            sd  = sd(ins.egarch11ma1mu0@fit$residuals, na.rm = T)),
+      col = "darkblue", lwd = 2, add = TRUE,
+)
+
+empstats <- basicStats(ins.egarch11ma1mu0@fit$residuals)
+knitr::kable(as.matrix(empstats), digits = 2)
+
+jbtest_residuals <- jarque.bera.test(ins.egarch11ma1mu0@fit$residuals)
+jbtest_residuals
+
+plot(ins.egarch11ma1mu0@fit$residuals, type ="l", lwd=2, ylab = "Reszty", main = "Reszty modelu MA(1)-EGARCH(1,1)")
+```
+
+Właściwości reszt modelu EGARCH są niemalże identyczne jak w przypadku modelu GARCH, nie można zatem w tym przypadku mówić o występowaniu efektu dźwigni, a modelem lepszym wydaje się być model GARCH, dla kompletności analizy VaR oszacowany zostanie za pomocą prognoz z obydwu modeli.
+
+### Value at Risk
+poniżej znajduje się porównanie prognoz jednodniowych.
+
+```{r}
+forecast_garch11ma1mu0 <-ugarchforecast(ins.garch11ma1mu0, n.ahead = 1)
+forecast2_garch11ma1mu0 <- forecast_garch11ma1mu0@forecast$sigmaFor[1,1]
+VaR_garch11ma1mu0 <- total_r_std_q01*forecast2_garch11ma1mu0
+VaR_garch11ma1mu0
+
+forecast_egarch11ma1mu0 <-ugarchforecast(ins.egarch11ma1mu0, n.ahead = 1)
+forecast2_egarch11ma1mu0 <- forecast_egarch11ma1mu0@forecast$sigmaFor[1,1]
+VaR_egarch11ma1mu0 <- total_r_std_q01*forecast2_egarch11ma1mu0
+VaR_egarch11ma1mu0
+```
+Widzimy, że w przypadku jednej obserwacji modele niewiele różnią się od siebie, co zostało poniżej zweryfikowane za pomocą pętli (cały okres out of samlpe - czas wykonania to 15-30 sekund)
+```{r, results='hide'}
+# dodanie numeru obserwacji
+data$obs = 1:length(data$total_r)
+
+start <- data$obs[data$Date == as.Date("2020-02-11")] # pierwszy dzien oos
+stop <- data$obs[data$Date == as.Date("2020-06-21")] # ostatni dzien oos
+data2 <- data[start:stop, ] # df do zapisywania VaR
+VaR.garch <- rep(NA, times = stop-start+1) # wektor VaR dla modelu MA(1)-GARCH(1,1), mu = 0
+VaR.egarch <- rep(NA, times = stop-start+1) # wektor VaR dla modelu MA(1)-EGARCH(1,1), mu = 0
+
+time1 = Sys.time()
+for(k in start:stop){
+  # generowanie zbioru danych zawierajacego obserwacje do dnia przed dniem prognozny
+  # (prognozy jednodniowe) => powiekszanie proby o jeden dzien z kazda iteracja
+  tmp.data <- data[data$obs <= (k-1), ] 
+  # reszty standaryzowane
+  tmp.data$rstd <- (tmp.data$total_r-mean(tmp.data$total_r, na.rm = T))/sd(tmp.data$total_r, na.rm = T)
+  # pierwszy kwantyl empiryczny
+  q01 <- quantile(tmp.data$rstd, 0.01, na.rm = T)
+  # specyfikacja modelu MA(1)-GARCH(1,1), mu = 0
+  spec.garch <- ugarchspec(variance.model = list(model = "sGARCH",
+                                                 garchOrder = c(1, 1)),
+                           mean.model = list(armaOrder = c(0, 1),
+                                             include.mean = F),
+                           distribution.model = "norm")
+  # specyfikacja modelu MA(1)-EGARCH(1,1), mu = 0
+  spec.egarch <- ugarchspec(variance.model = list(model = "eGARCH",
+                                                  garchOrder = c(1, 1)),
+                            mean.model = list(armaOrder = c(0, 1),
+                                              include.mean = F),
+                            distribution.model = "norm")
+  # estymacja modelu (zwroty z portfela z bazy tmp)
+    # GARCH
+  tmp.garch11ma1mu0 <- ugarchfit(spec = spec.garch, data = na.omit(tmp.data$total_r))
+    # EGARCH
+  tmp.egarch11ma1mu0 <- ugarchfit(spec = spec.egarch, data = na.omit(tmp.data$total_r))
+  # jednodniowa predykcja wariancji
+    # GARCH
+  sigma_forecast.garch <- ugarchforecast(tmp.garch11ma1mu0, n.ahead = 1)
+    # EGARCH
+  sigma_forecast.egarch <- ugarchforecast(tmp.egarch11ma1mu0, n.ahead = 1)
+  # technikalia - zapis wartosci predykcji wariancji jako numeric
+    # GARCH
+  sigma_forecast2.garch <- sigma_forecast.garch@forecast$sigmaFor[1,1]
+    # EGARCH
+  sigma_forecast2.egarch <- sigma_forecast.egarch@forecast$sigmaFor[1,1]
+  # obliczenie i zapis VaR do wektora (k = <start; stop>)
+    # GARCH
+  VaR.garch[k-start+1] <- q01*sigma_forecast2.garch
+    # EGARCH
+  VaR.egarch[k-start+1] <- q01*sigma_forecast2.egarch
+}
+time2 = Sys.time()
+# czas obliczen
+print(time2 - time1)
+# dodanie kolumny VaR
+data2$VaR.garch <- VaR.garch
+data2$VaR.egarch <- VaR.egarch
+```
+
+Poniżej wykres oszacowań VaR dla obu modeli oraz porównanie ich ze zwrotem z portfela.
+
+```{r}
+plot(data2$Date, data2$total_r, col = "darkblue", lwd = 2, type = 'l', ylab = "zwroty/VaR", xlab = "Data",
+     main = "Oszacowania 1% Value at Risk")
+abline(h = 0, lty = 2)
+lines(data2$Date, data2$VaR.garch, lwd = 2, type = 'l', col = "darkgreen")
+lines(data2$Date, data2$VaR.egarch, lwd = 2, type = 'l', col = "darkred")
+legend("topleft", c("Returns out of sample", "VaR MA(1)-GARCH(1,1)", "VaR MA(1)-EGARCH(1,1)"), 
+        text.col=c('darkblue', 'darkgreen', 'darkred'), cex = 0.75)
+```
+
+Analiza graficzna wskazuje na podobne wyniki obydwu modeli, niezbędna jest zatem dokładna weryfikacja numeryczna jako frakcja realizacj mniejszych od VaR.
+
+```{r}
+#   VaR MA(1)-GARCH(1,1)
+sum(data2$total_r < data2$VaR.garch) / length(data2$VaR.garch)
+#   VaR MA(1)-EGARCH(1,1)
+sum(data2$total_r < data2$VaR.egarch) / length(data2$VaR.egarch)
+```
+
+Żaden z modeli nie daje idealnych oszacowań, możemy stwierdzić, że są one niedotrenowane (*underfitted*), jednocześnie potwierdza się teza mówiąca o wyższości modelu MA(1)-GARCH(1,1) nad jego zlogarytmowaną wersją EGARCH.
+
+### Analiza wrażliwości
+Próba treningowa (in sample) kończy się 10-02-2020, dzięki czemu próba testowa (out of sample) zawiera w sobie 3 spore skoki wariancji z czego największy z nich przypada na koniec lutego - poczatek kwietnia, bardzo możliwe, że te szoki związane są z epidemią koronawirusa. Wydłużenie okresu in sample o efekt epidemii wydaje się zatem niezwykle interesujące, można się bowiem spodziewać spotęgowania efektów ARCH i być może lepsze dopasowanie estymowanych modeli do danych, jednocześnie skrócony  zostanie okres out of sample. Analiza wrażliwości w druga stronę tj. skrócenie in sample wydaje się mało atrakcyjna bowiem wariancja zachowuje się tam dość stabilnie oraz próba spadłaby poniżej wymaganej liczebności 300, ponadto bardzo możliwe, że efekty ARCH byłby wtedy zbyt słabe (w MA(1)-GARCH(1,1) oszacowanie $\alpha_1$ było na granicy istotności).
+za nową granicę uznana zostaje data 24 Marca 2020.
+
+```{r}
+ins2 = data[which(data$Date < "2020-03-24"),]
+outs2 = data[-which(data$Date < "2020-03-24"),]
+
+# MA(1)-GARCH(1,1), mu = 0
+spec <- ugarchspec(variance.model = list(model = "sGARCH",
+                                         garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(0, 1),
+                                     include.mean = F),
+                   distribution.model = "norm")
+
+ins2.garch11ma1mu0 <- ugarchfit(spec = spec,
+                                data = na.omit(ins2$total_r))
+
+# MA(1)-EGARCH(1,1), mu = 0
+spec <- ugarchspec(variance.model = list(model = "eGARCH",
+                                         garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(0, 1),
+                                     include.mean = F),
+                   distribution.model = "norm")
+
+ins2.egarch11ma1mu0 <- ugarchfit(spec = spec,
+                                 data = na.omit(ins2$total_r))
+```
+
+```{r, echo=F, results='asis'}
+kable(ins2.garch11ma1mu0@fit$matcoef, caption = "Oszacowania modelu MA(1)-GARCH(1,1) po zwiększeniu in sample")
+```
+
+```{r, echo=F, results='asis'}
+kable(ins2.egarch11ma1mu0@fit$matcoef, caption = "Oszacowania modelu MA(1)-EGARCH(1,1) po zwiększeniu in sample")
+```
+
+Tak jak się można było spodziewać, włączenie dodatkowego skoku wariancji spowodowało spotęgowanie efektów ARCH - oszacowania parametrów $\alpha_1$ i $\beta_1$ są wyższe i znacznie pewniejsze (dużo niższe p_value dla H0 o nieistotności). O dopasowaniu modeli powie analiza prognoz VaR.
+
+```{r, results='hide'}
+start <- data$obs[data$Date == as.Date("2020-03-24")] # pierwszy dzien oos
+stop <- data$obs[data$Date == as.Date("2020-06-21")] # ostatni dzien oos
+data3 <- data[start:stop, ] # df do zapisywania VaR
+VaR.garch <- rep(NA, times = stop-start+1) # wektor VaR dla modelu MA(1)-GARCH(1,1), mu = 0
+VaR.egarch <- rep(NA, times = stop-start+1) # wektor VaR dla modelu MA(1)-EGARCH(1,1), mu = 0
+
+time1 = Sys.time()
+for(k in start:stop){
+  # generowanie zbioru danych zawierajacego obserwacje do dnia przed dniem prognozny
+  # (prognozy jednodniowe) => powiekszanie proby o jeden dzien z kazda iteracja
+  tmp.data <- data[data$obs <= (k-1), ] 
+  # reszty standaryzowane
+  tmp.data$rstd <- (tmp.data$total_r-mean(tmp.data$total_r, na.rm = T))/sd(tmp.data$total_r, na.rm = T)
+  # pierwszy kwantyl empiryczny
+  q01 <- quantile(tmp.data$rstd, 0.01, na.rm = T)
+  # specyfikacja modelu MA(1)-GARCH(1,1), mu = 0
+  spec.garch <- ugarchspec(variance.model = list(model = "sGARCH",
+                                                 garchOrder = c(1, 1)),
+                           mean.model = list(armaOrder = c(0, 1),
+                                             include.mean = F),
+                           distribution.model = "norm")
+  # specyfikacja modelu MA(1)-EGARCH(1,1), mu = 0
+  spec.egarch <- ugarchspec(variance.model = list(model = "eGARCH",
+                                                  garchOrder = c(1, 1)),
+                            mean.model = list(armaOrder = c(0, 1),
+                                              include.mean = F),
+                            distribution.model = "norm")
+  # estymacja modelu (zwroty z portfela z bazy tmp)
+  # GARCH
+  tmp.garch11ma1mu0 <- ugarchfit(spec = spec.garch, data = na.omit(tmp.data$total_r))
+  # EGARCH
+  tmp.egarch11ma1mu0 <- ugarchfit(spec = spec.egarch, data = na.omit(tmp.data$total_r))
+  # jednodniowa predykcja wariancji
+  # GARCH
+  sigma_forecast.garch <- ugarchforecast(tmp.garch11ma1mu0, n.ahead = 1)
+  # EGARCH
+  sigma_forecast.egarch <- ugarchforecast(tmp.egarch11ma1mu0, n.ahead = 1)
+  # technikalia - zapis wartosci predykcji wariancji jako numeric
+  # GARCH
+  sigma_forecast2.garch <- sigma_forecast.garch@forecast$sigmaFor[1,1]
+  # EGARCH
+  sigma_forecast2.egarch <- sigma_forecast.egarch@forecast$sigmaFor[1,1]
+  # obliczenie i zapis VaR do wektora (k = <start; stop>)
+  # GARCH
+  VaR.garch[k-start+1] <- q01*sigma_forecast2.garch
+  # EGARCH
+  VaR.egarch[k-start+1] <- q01*sigma_forecast2.egarch
+}
+time2 = Sys.time()
+# czas obliczen
+print(time2 - time1)
+# dodanie kolumny VaR
+data3$VaR.garch <- VaR.garch
+data3$VaR.egarch <- VaR.egarch
+
+```
+
+```{r}
+plot(data3$Date, data3$total_r, col = "darkblue", lwd = 2, type = 'l', ylab = "zwroty/VaR", xlab = "Data",
+     main = "Oszacowania 1% Value at Risk")
+abline(h = 0, lty = 2)
+lines(data3$Date, data3$VaR.garch, lwd = 2, type = 'l', col = "darkgreen")
+lines(data3$Date, data3$VaR.egarch, lwd = 2, type = 'l', col = "darkred")
+legend("topleft", c("Returns out of sample", "VaR MA(1)-GARCH(1,1)", "VaR MA(1)-EGARCH(1,1)"), 
+       text.col=c('darkblue', 'darkgreen', 'darkred'), cex = 0.75)
+```
+
+Frakcja VaR < $r_t$
+
+```{r}
+#   VaR MA(1)-GARCH(1,1)
+sum(data3$total_r < data3$VaR.garch) / length(data3$VaR.garch)
+#   VaR MA(1)-EGARCH(1,1)
+sum(data3$total_r < data3$VaR.egarch) / length(data3$VaR.egarch)
+```
+
+Wyniki zgodne z intuicja - model "się douczył" jednoczesnie przeuczając sie na MA(1)-GARCH(1,1) i osiągając zbliżone wyniki do MA(1)-GARCH(1,1) na mniejszej próbie przy modelu MA(1)-EGARCH(1,1). Oczywiście ze względu na inny zbiór obserwacji nie możemy porównać modeli z powyższego eksperymentu z pierwotnymi za pomoca kryteriów informacyjnych, możemy zauważyć jedynie, że zmiana okna in sample wpłynęła na wyniki oszacowania VaR przeszacowując wręcz, na jak się wcześniej okazało, lepszym dla tego problemu modelu MA(1)-GARCH(1,1). W modelu MA(1)-GARCH(1,1) wydłużenie okresu in sample o dodatkowy duży skok wariancji odbiło sie na estymacji wyzszych parametrow w przypadku $\beta_1$ i $\alpha_1$ reszta pozostała na zbliżonym poziomie co jest wytłumaczalne teorią. W modelu MA(1)-EGARCH(1,1) wydłużenie okresu in sample spowodowało dodatkowo uznanie parametru $\alpha_1$ za istotny, jednocześnie $\gamma$ pozostała na bardzo zbliżonym poziomie, zatem wydłużenie okresu in sample nie dało przesłanek do wątpienia w hipotezę o braku efektu dźwigni dla niniejszego portfela.
+
+### Wnioski
+Zbudowany w badaniu portfel zdecydowanie charakteryzuje się grupowaniem wariancji oraz leptokurtycznością rozkładu, są to warunki idealne do modelowania za pomocą modeli grupy GARCH. W niniejszym badaniu dokonana została próba oszacowania warunkowej wariancji i wartości narażonej na ryzyko. Wyniki sugerują konieczność zwiększenia liczby obserwacji, w szczególności in sample, bowiem bardzo istotne dla modeli GARCH parametry $\alpha_1$ zyskiwały znacznie na istotności po zwiększeniu in sample, co jest oczywiście wytłumaczalne dodatkowym skokiem wariancji. Jednocześnie należy zwrócić uwagę na utrudnione warunki modelowania wariancji cen instrumentów finasowych w przypadku zagrożenia epidemiologicznego - jak można było zauważyć wariancja w okresie pandemii wzrosła dwukrotnie, a okres ten przypada na koniec dostępnego horyzontu zatem musi być uwzględniony w podpróbie testowej jeżeli chcemy dokonać oceny modelu *ex post* od razu. Niemniej wyniki, zwłaszcza niezlogarytmowanego modelu wydają się być obiecujące i dla takiego portfela raczej nie ma sensu stosowanie modelu EGARCH. 
